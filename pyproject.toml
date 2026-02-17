@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ramish-explorer"
+version = "0.1.0"
+description = "Explore .ramish knowledge graph files — query, validate, predict, and audit geometric truth."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "A.I. Sciences LLC", email = "support@ramish.io"},
+]
+keywords = ["knowledge-graph", "quaternion", "embeddings", "data-quality", "audit"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "numpy>=1.20",
+    "click>=8.0",
+    "rich>=12.0",
+]
+
+[project.urls]
+Homepage = "https://ramish.io"
+Documentation = "https://ramish.io/docs"
+Repository = "https://github.com/aisciencesllc/ramish-explorer"
+
+[project.scripts]
+ramish-explorer = "ramish_explorer.cli:cli"
+re = "ramish_explorer.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["ramish_explorer*"]
