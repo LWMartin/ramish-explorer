@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ramish-explorer"
-version = "0.1.0"
+version = "0.1.1"
 description = "Explore .ramish knowledge graph files — query, validate, predict, and audit geometric truth."
 readme = "README.md"
 license = {text = "MIT"}
@@ -36,7 +36,7 @@ dependencies = [
 [project.urls]
 Homepage = "https://ramish.io"
 Documentation = "https://ramish.io/docs"
-Repository = "https://github.com/aisciencesllc/ramish-explorer"
+Repository = "https://github.com/LWMartin/ramish-explorer"
 
 [project.scripts]
 ramish-explorer = "ramish_explorer.cli:cli"
