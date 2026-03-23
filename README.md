@@ -16,7 +16,7 @@ pip install ramish-explorer
 # File overview
 ramish-explorer stats engine.ramish
 
-# Natural language search
+# Hybrid geometric + graph query
 ramish-explorer query engine.ramish "What relates to AC/DC?"
 
 # Show all connections for an entity
@@ -28,8 +28,11 @@ ramish-explorer similar engine.ramish "ABC Plumbing"
 # Validate a specific relationship
 ramish-explorer validate engine.ramish "Led Zeppelin" "genre" "Rock"
 
-# Predict missing links
+# Predict missing links (frozen key rotation)
 ramish-explorer predict engine.ramish "Sunset Condo" "serviced_by"
+
+# Recommend based on neighborhood averaging
+ramish-explorer recommend engine.ramish "AC/DC" "has_genre"
 
 # Interactive exploration
 ramish-explorer explore engine.ramish
@@ -40,11 +43,12 @@ ramish-explorer explore engine.ramish
 | Command | Description |
 |---------|-------------|
 | `stats` | File structure, geometry, and trust weight distribution |
-| `query` | Natural language search with wave propagation |
+| `query` | Hybrid geometric retrieval with graph reranking |
 | `validate` | Check a specific triple (subject, relation, object) |
 | `edges` | Show all edges for an entity with trust weights |
 | `similar` | Find nearest neighbors by embedding distance |
 | `predict` | Frozen key rotation inference (head + relation → tail) |
+| `recommend` | Neighborhood averaging — entities similar to known targets |
 | `compose` | Multi-hop quaternion composition (relation1 ⊗ relation2) |
 | `keys` | Extract frozen relational keys with stability metrics |
 | `audit` | Structural integrity report |
@@ -69,11 +73,42 @@ Generate `.ramish` files at [ramish.io](https://ramish.io).
 - **Relationship exploration** — `edges` shows the full connection web for any entity
 - **Link prediction** — `predict` finds missing connections using frozen key rotation
 - **Drift monitoring** — compare `.ramish` files over time to track data quality changes
+- **Geometric search** — `query` combines embedding-space retrieval with graph structure for discovery
 
 ## Requirements
 
 - Python 3.8+
 - numpy, click, rich (installed automatically)
+
+## Changelog
+
+### v0.2.0 (2026-03-23)
+
+**Geometric query engine** — `query()` now uses hybrid lexical-seed → geometric retrieval → graph rerank, replacing the v0.1 wave-propagation path. Geometry provides recall, graph edges provide precision. Results without graph support are marked with `~similar`.
+
+**Relation indexes** — Pre-built lookup tables (`edges_by_rel_type`, `out_edges`, `in_edges`, compound indexes) replace full linear scans in `predict`, `compose`, `keys`, and REPL commands. Single O(n) build pass during `load()`.
+
+**Sign-aligned frozen keys** — Frozen key extraction now aligns quaternion signs before averaging, eliminating partial cancellation from sign ambiguity. Keys are cached per session (13,000x speedup on subsequent access). Stability score included.
+
+**Canonical quaternion layout** — Single `embedding_to_quats()` helper replaces all inline reshape/transpose patterns. One source of truth for the component-major → (n, dim, 4) conversion.
+
+**Predict/recommend split** — `predict` now always uses frozen key rotation (geometric inference). The old neighborhood-averaging behavior moves to a new `recommend` command.
+
+**File safety hardening** — Header validation rejects files with entity/relation counts exceeding sanity bounds or file sizes too small for declared contents. Entity name length capped.
+
+**Test suite expansion** — 90 tests covering indexes, geometric query, sign alignment, quaternion layout, file safety, predict semantics, and name resolution. All 33 original v0.1 regression tests pass unchanged.
+
+### v0.1.2 (2026-02-24)
+
+Frozen rotation key infrastructure (`.rkey` files), spectral coherence scoring fix, Chinook audit time 16+ min → ~20 sec, exact edge hash storage.
+
+### v0.1.1 (2026-02-22)
+
+Fix repository URL in package metadata.
+
+### v0.1.0 (2026-02-22)
+
+Initial release. Reader, CLI, REPL, quaternion math, trust weight validation, audit.
 
 ## License
 
@@ -83,3 +118,4 @@ MIT
 
 - [Ramish.io](https://ramish.io) — Generate .ramish files
 - [Documentation](https://ramish.io/docs)
+- [GitHub](https://github.com/LWMartin/ramish-explorer)

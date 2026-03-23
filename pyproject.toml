@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ramish-explorer"
-version = "0.1.1"
+dynamic = ["version"]
 description = "Explore .ramish knowledge graph files — query, validate, predict, and audit geometric truth."
 readme = "README.md"
 license = {text = "MIT"}
@@ -44,3 +44,6 @@ re = "ramish_explorer.cli:cli"
 
 [tool.setuptools.packages.find]
 include = ["ramish_explorer*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "ramish_explorer.__version__"}

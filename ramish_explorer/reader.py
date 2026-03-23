@@ -1,18 +1,28 @@
 """
-.ramish File Format Reader
+.ramish File Format Reader — v0.2.0
 
 Binary format reader for portable knowledge graphs with truth weights.
 This is the read-only version for the ramish-explorer package.
+
+v0.2 changes:
+- Canonical embedding_to_quats() helper (Step 2)
+- Relation-type and compound indexes (Step 3)
+- Precomputed embedding norms (Step 4)
+- Sign-aligned frozen key extraction with lazy cache (Step 5)
+- File safety validation (Step 7)
+- Hybrid geometric query engine with graph rerank (Step 8)
 """
 import struct
 import json
+import re
 import numpy as np
 from pathlib import Path
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Union
 from dataclasses import dataclass
 
 from .models import Entity, Relation
 from .quantize import EmbeddingQuantizer
+from .quate import hamilton_product_np, quaternion_conjugate_np
 
 
 MAGIC = b'RAMISH'
@@ -24,6 +34,11 @@ QUANT_FP16 = 1
 QUANT_INT8 = 2
 QUANT_DTYPE_MAP = {QUANT_FP32: "fp32", QUANT_FP16: "fp16", QUANT_INT8: "int8"}
 QUANT_CODE_MAP = {"fp32": QUANT_FP32, "fp16": QUANT_FP16, "int8": QUANT_INT8}
+
+# v0.2: Safety limits
+MAX_ENTITY_COUNT = 500_000_000       # 500M entities
+MAX_RELATION_COUNT = 5_000_000_000   # 5B relations
+MAX_NAME_LENGTH = 10_000             # 10K bytes per entity name
 
 
 @dataclass
@@ -76,6 +91,7 @@ class AuditResult:
 @dataclass
 class HubInfo:
     """Information about a hub entity."""
+    entity_id: int
     name: str
     entity_type: str
     degree: int
@@ -121,6 +137,93 @@ class RamishFile:
         self._loaded_path: Optional[Path] = None
         self._quantize_dtype: str = "fp32"
 
+        # v0.2 Step 3: Relation indexes
+        self.edges_by_rel_type: Dict[int, List[int]] = {}
+        self.out_edges: Dict[int, Dict[int, List[int]]] = {}
+        self.in_edges: Dict[int, Dict[int, List[int]]] = {}
+        self.targets_by_head_rel: Dict[Tuple[int, int], List[int]] = {}
+        self.heads_by_tail_rel: Dict[Tuple[int, int], List[int]] = {}
+
+        # v0.2 Step 4: Precomputed norms
+        self._embedding_norms: Optional[np.ndarray] = None
+
+        # v0.2 Step 5: Frozen key cache
+        self._frozen_keys: Dict[int, np.ndarray] = {}
+        self._frozen_key_stability: Dict[int, float] = {}
+
+    # ── Step 2: Canonical quaternion layout helper ─────────────────
+
+    def embedding_to_quats(self, entity_ids: Union[int, List[int], np.ndarray]) -> np.ndarray:
+        """
+        Extract quaternion arrays from stored embeddings.
+
+        Stored layout (component-major): [a1..ad, b1..bd, c1..cd, d1..dd]
+        Output: (n, dim, 4) array where last axis is [a, b, c, d] per dimension.
+
+        Single entity: returns (dim, 4)
+        Multiple entities: returns (n, dim, 4)
+        """
+        if isinstance(entity_ids, int):
+            emb = self.embeddings[entity_ids]  # (dim*4,)
+            return emb.reshape(4, self._embedding_dim).T  # (dim, 4)
+        else:
+            ids = np.asarray(entity_ids)
+            emb = self.embeddings[ids]  # (n, dim*4)
+            return emb.reshape(len(ids), 4, self._embedding_dim).transpose(0, 2, 1)  # (n, dim, 4)
+
+    # ── Step 5: Sign-aligned frozen key extraction ────────────────
+
+    def _extract_frozen_key(self, rel_type: int) -> Tuple[Optional[np.ndarray], float]:
+        """
+        Extract sign-aligned frozen key for a relation type.
+
+        Returns:
+            (key, stability) where key is (dim, 4) and stability is [0, 1].
+            Returns (None, 0.0) if no instances exist.
+        """
+        # Check cache first
+        if rel_type in self._frozen_keys:
+            return self._frozen_keys[rel_type], self._frozen_key_stability[rel_type]
+
+        indices = self.edges_by_rel_type.get(rel_type, [])
+        if not indices:
+            return None, 0.0
+
+        head_ids = [self.relations[i].head_id for i in indices]
+        tail_ids = [self.relations[i].tail_id for i in indices]
+
+        h_q = self.embedding_to_quats(head_ids)  # (n, dim, 4)
+        t_q = self.embedding_to_quats(tail_ids)  # (n, dim, 4)
+
+        # Individual keys: conj(head) * tail
+        individual_keys = hamilton_product_np(quaternion_conjugate_np(h_q), t_q)  # (n, dim, 4)
+
+        # Sign alignment: align each key to the first one
+        if len(individual_keys) > 1:
+            reference = individual_keys[0]  # (dim, 4)
+            # For each key, check if dot product with reference is negative
+            # If so, flip the sign (q and -q represent the same rotation)
+            for i in range(1, len(individual_keys)):
+                dot = np.sum(individual_keys[i] * reference)
+                if dot < 0:
+                    individual_keys[i] = -individual_keys[i]
+
+        frozen_key = np.mean(individual_keys, axis=0)  # (dim, 4)
+
+        # Stability: how consistent are individual keys vs the mean?
+        deviations = np.linalg.norm(individual_keys - frozen_key, axis=-1)  # (n, dim)
+        avg_dev = float(np.mean(deviations))
+        key_norm = float(np.mean(np.linalg.norm(frozen_key, axis=-1)))
+        stability = max(0.0, 1.0 - avg_dev / max(key_norm, 1e-8))
+
+        # Cache it
+        self._frozen_keys[rel_type] = frozen_key
+        self._frozen_key_stability[rel_type] = stability
+
+        return frozen_key, stability
+
+    # ── Load / Save ───────────────────────────────────────────────
+
     @classmethod
     def load(cls, path: str) -> 'RamishFile':
         """Load from .ramish file.
@@ -133,9 +236,14 @@ class RamishFile:
         rf = cls()
         rf._loaded_path = path
 
+        file_size = path.stat().st_size
+
         with open(path, 'rb') as f:
             header = f.read(64)
             rf._parse_header(header)
+
+            # v0.2 Step 7: Validate header before allocating
+            rf._validate_header(header, file_size)
 
             rf._read_entities(f)
             rf._read_relations(f)
@@ -262,6 +370,28 @@ class RamishFile:
         self._rel_type_count = struct.unpack_from('<H', header, 30)[0]
         self._int8_scale = struct.unpack_from('<d', header, 32)[0]
 
+    # v0.2 Step 7: Header validation
+    def _validate_header(self, header: bytes, file_size: int):
+        """Validate header values against safety limits before allocating."""
+        if self._entity_count > MAX_ENTITY_COUNT:
+            raise ValueError(
+                f"Entity count {self._entity_count:,} exceeds maximum "
+                f"({MAX_ENTITY_COUNT:,}). File may be corrupt."
+            )
+        if self._relation_count > MAX_RELATION_COUNT:
+            raise ValueError(
+                f"Relation count {self._relation_count:,} exceeds maximum "
+                f"({MAX_RELATION_COUNT:,}). File may be corrupt."
+            )
+        # Sanity: embedding section alone shouldn't exceed file size
+        if self._entity_count > 0 and self._embedding_dim > 0:
+            min_embed_bytes = self._entity_count * self._embedding_dim * 4  # fp32 minimum
+            if min_embed_bytes > file_size * 2:  # 2x slack for overhead
+                raise ValueError(
+                    f"Claimed embedding size ({min_embed_bytes:,} bytes) is implausible "
+                    f"for file of {file_size:,} bytes. File may be corrupt."
+                )
+
     def _write_entities(self, f):
         """Write entity section."""
         type_to_id = {t: i for i, t in enumerate(self.entity_types)}
@@ -278,6 +408,12 @@ class RamishFile:
         for i in range(self._entity_count):
             type_id = struct.unpack('<H', f.read(2))[0]
             name_len = struct.unpack('<H', f.read(2))[0]
+            # v0.2 Step 7: Name length cap
+            if name_len > MAX_NAME_LENGTH:
+                raise ValueError(
+                    f"Entity {i} name length {name_len} exceeds maximum "
+                    f"({MAX_NAME_LENGTH}). File may be corrupt."
+                )
             name = f.read(name_len).decode('utf-8')
             self.entities.append(Entity(
                 id=i,
@@ -329,7 +465,12 @@ class RamishFile:
                 pass
 
     def _build_indexes(self):
-        """Build internal indexes for fast lookup."""
+        """Build internal indexes for fast lookup.
+
+        v0.2: Also builds relation-type indexes, compound lookups,
+        and precomputed embedding norms.
+        """
+        # Existing name/id indexes
         self.name_to_id = {}
         self.name_to_ids = {}
         self.id_to_entity = {}
@@ -341,9 +482,10 @@ class RamishFile:
             self.name_to_ids[key].append(e.id)
             self.id_to_entity[e.id] = e
 
+        # Existing adjacency list
         self.neighbors = {}
         for i, r in enumerate(self.relations):
-            weight = self.truth_weights[i] if self.truth_weights is not None else 0.5
+            weight = float(self.truth_weights[i]) if self.truth_weights is not None else 0.5
 
             if r.head_id not in self.neighbors:
                 self.neighbors[r.head_id] = []
@@ -354,6 +496,48 @@ class RamishFile:
             self.neighbors[r.tail_id].append((r.head_id, r.relation_type, weight))
 
         self._compute_adaptive_threshold()
+
+        # v0.2 Step 3: Relation-type indexes (single pass)
+        self.edges_by_rel_type = {}
+        self.out_edges = {}
+        self.in_edges = {}
+        self.targets_by_head_rel = {}
+        self.heads_by_tail_rel = {}
+
+        for i, r in enumerate(self.relations):
+            # edges_by_rel_type
+            if r.relation_type not in self.edges_by_rel_type:
+                self.edges_by_rel_type[r.relation_type] = []
+            self.edges_by_rel_type[r.relation_type].append(i)
+
+            # out_edges: head_id -> {rel_type -> [indices]}
+            if r.head_id not in self.out_edges:
+                self.out_edges[r.head_id] = {}
+            if r.relation_type not in self.out_edges[r.head_id]:
+                self.out_edges[r.head_id][r.relation_type] = []
+            self.out_edges[r.head_id][r.relation_type].append(i)
+
+            # in_edges: tail_id -> {rel_type -> [indices]}
+            if r.tail_id not in self.in_edges:
+                self.in_edges[r.tail_id] = {}
+            if r.relation_type not in self.in_edges[r.tail_id]:
+                self.in_edges[r.tail_id][r.relation_type] = []
+            self.in_edges[r.tail_id][r.relation_type].append(i)
+
+            # Compound lookups
+            hr_key = (r.head_id, r.relation_type)
+            if hr_key not in self.targets_by_head_rel:
+                self.targets_by_head_rel[hr_key] = []
+            self.targets_by_head_rel[hr_key].append(r.tail_id)
+
+            tr_key = (r.tail_id, r.relation_type)
+            if tr_key not in self.heads_by_tail_rel:
+                self.heads_by_tail_rel[tr_key] = []
+            self.heads_by_tail_rel[tr_key].append(r.head_id)
+
+        # v0.2 Step 4: Precomputed embedding norms
+        if self.embeddings is not None:
+            self._embedding_norms = np.linalg.norm(self.embeddings, axis=1)
 
     def _compute_adaptive_threshold(self):
         """Compute density-adaptive threshold for thick cables."""
@@ -366,30 +550,201 @@ class RamishFile:
         self._weight_threshold = float(np.percentile(self.truth_weights, 75))
         self._weight_threshold = max(self._weight_threshold, 0.1)
 
+    # ── Fix 3: Centralized name resolution ─────────────────────────
+
+    def resolve_name(self, name: str) -> Tuple[List[int], bool]:
+        """Resolve a name to entity IDs using the multi-map.
+
+        Returns (entity_ids, ambiguous) where ambiguous=True when
+        multiple entities share the same name.  Empty list if no match.
+        """
+        key = name.lower()
+        ids = self.name_to_ids.get(key, [])
+        if ids:
+            return (list(ids), len(ids) > 1)
+        return ([], False)
+
+    def resolve_name_fuzzy(self, name: str, max_suggestions: int = 10) -> Tuple[List[int], bool, List[str]]:
+        """Resolve with fuzzy fallback.
+
+        Returns (entity_ids, ambiguous, suggestions).
+        If exact match found: suggestions is empty.
+        If no exact match: entity_ids is empty, suggestions has close matches.
+        """
+        ids, ambiguous = self.resolve_name(name)
+        if ids:
+            return (ids, ambiguous, [])
+
+        # Fuzzy: substring match against all known names
+        key = name.lower()
+        suggestions = [n for n in self.name_to_ids.keys() if key in n]
+        return ([], False, suggestions[:max_suggestions])
+
+    # ── Step 8: Geometric query engine ────────────────────────────
+
     def query(self, query_text: str, topk: int = 10) -> List[QueryResult]:
-        """Query the knowledge graph with natural language."""
+        """Query the knowledge graph — hybrid geometric + graph rerank.
+
+        v0.2: Uses geometric cosine retrieval seeded by lexical match,
+        then injects known graph neighbors and reranks.
+        Falls back to wave propagation if no embeddings.
+        """
         query_lower = query_text.lower()
 
-        seed_entities = []
-        for name, entity_id in self.name_to_id.items():
-            if name in query_lower:
-                seed_entities.append(entity_id)
+        # === Three-tier lexical seed matching ===
+        #
+        # Tier 1: Entity name boundary-matches inside query text
+        #   "What about Led Zeppelin?" → seeds "led zeppelin"
+        #
+        # Tier 2: Query boundary-matches inside entity names (bidirectional)
+        #   query "session_briefing" → seeds "session_briefing.py"
+        #   query "config_reader" → seeds "config_reader.py", "config_reader.js"
+        #
+        # Tier 3: Individual query words boundary-match inside entity names
+        #   query "session briefing analysis" → seeds entities containing "session", "briefing"
+        #
+        # All tiers use \b word boundaries. Underscore is a word character,
+        # so "get" won't match inside "budget_getter" via tier 1, and
+        # "ramish_explorer" won't match inside "test_ramish_explorer" via tier 2.
+        # The . in "file.py" IS a boundary, so "file" matches "file.py".
 
+        seed_entities = []
+
+        # Tier 1: entity name ⊂ query
+        for name, ids in self.name_to_ids.items():
+            if re.search(r'\b' + re.escape(name) + r'\b', query_lower):
+                seed_entities.extend(ids)
+
+        # Tier 2: query ⊂ entity name (only if tier 1 found nothing)
+        if not seed_entities and len(query_lower) > 2:
+            query_pattern = re.compile(r'\b' + re.escape(query_lower) + r'\b')
+            for name, ids in self.name_to_ids.items():
+                if query_pattern.search(name):
+                    seed_entities.extend(ids)
+
+        # Tier 3: query words ⊂ entity names (only if tiers 1-2 found nothing)
         if not seed_entities:
-            for name, entity_id in self.name_to_id.items():
-                words = query_lower.split()
-                if any(w in name for w in words if len(w) > 3):
-                    seed_entities.append(entity_id)
-                    if len(seed_entities) >= 3:
+            words = [w for w in query_lower.split() if len(w) > 3]
+            for name, ids in self.name_to_ids.items():
+                for w in words:
+                    if re.search(r'\b' + re.escape(w) + r'\b', name):
+                        seed_entities.extend(ids)
                         break
+                if len(seed_entities) >= 5:
+                    break
 
         if not seed_entities:
             return []
 
+        # Deduplicate seeds while preserving order
+        seen = set()
+        unique_seeds = []
+        for sid in seed_entities:
+            if sid not in seen:
+                seen.add(sid)
+                unique_seeds.append(sid)
+        seed_entities = unique_seeds
+
+        # v0.2: If we have embeddings, use geometric retrieval
+        if self.embeddings is not None and self._embedding_norms is not None:
+            return self._geometric_query(seed_entities, topk)
+
+        # Fallback: wave propagation (v0.1 behavior)
         return self._wave_query(seed_entities, topk)
 
+    def _geometric_query(self, seed_ids: List[int], topk: int) -> List[QueryResult]:
+        """Hybrid geometric query: cosine retrieval + graph neighbor injection + rerank."""
+        results = []
+        seen = set()
+
+        for seed_id in seed_ids:
+            seed_entity = self.id_to_entity.get(seed_id)
+            if not seed_entity:
+                continue
+
+            seed_emb = self.embeddings[seed_id]
+            seed_norm = self._embedding_norms[seed_id]
+            if seed_norm < 1e-8:
+                continue
+
+            # Cosine similarity to all entities
+            similarities = self.embeddings @ seed_emb / (self._embedding_norms * seed_norm + 1e-8)
+            similarities[seed_id] = -1.0  # exclude self
+
+            # Get top geometric candidates
+            geo_top = np.argsort(similarities)[::-1][:topk * 3]
+
+            # Build candidate pool: geometric candidates + known graph neighbors
+            candidate_pool = {}  # entity_id -> (score, rel_name, is_graph_edge)
+
+            # Inject known graph neighbors first (★ = known edge)
+            if seed_id in self.neighbors:
+                for neighbor_id, rel_type, weight in self.neighbors[seed_id]:
+                    rel_name = self.relation_type_names.get(rel_type, f"relation_{rel_type}")
+                    # Score: use truth weight boosted by geometric similarity
+                    geo_sim = float(similarities[neighbor_id]) if neighbor_id < len(similarities) else 0.0
+                    combined_score = 0.6 * weight + 0.4 * max(0, geo_sim)
+                    key = (seed_id, rel_type, neighbor_id)
+                    if key not in seen:
+                        candidate_pool[neighbor_id] = (combined_score, rel_name, True)
+                        seen.add(key)
+
+            # Add geometric candidates (~ = inferred by geometry)
+            for idx in geo_top:
+                idx_int = int(idx)
+                if idx_int == seed_id or idx_int in candidate_pool:
+                    continue
+                neighbor_entity = self.id_to_entity.get(idx_int)
+                if not neighbor_entity:
+                    continue
+
+                sim = float(similarities[idx_int])
+                if sim < 0.01:
+                    break
+
+                # Infer likely relation type from entity type clustering
+                rel_name = self._infer_relation(seed_entity, neighbor_entity)
+                candidate_pool[idx_int] = (sim * 0.5, f"~{rel_name}", False)
+
+            # Sort by score and build results
+            sorted_candidates = sorted(candidate_pool.items(), key=lambda x: -x[1][0])
+
+            for entity_id, (score, rel_name, is_edge) in sorted_candidates[:topk]:
+                neighbor_entity = self.id_to_entity.get(entity_id)
+                if not neighbor_entity:
+                    continue
+                supporting_paths = max(1, int(score * 1000))
+                results.append(QueryResult(
+                    subject=seed_entity.name,
+                    relation=rel_name,
+                    object=neighbor_entity.name,
+                    truth_weight=min(1.0, score),
+                    supporting_paths=supporting_paths
+                ))
+
+        results.sort(key=lambda r: -r.truth_weight)
+        return results[:topk]
+
+    def _infer_relation(self, source: Any, target: Any) -> str:
+        """Infer most likely relation name between two entities based on type pair."""
+        # Look up what relation types typically connect these entity types
+        src_type = source.entity_type
+        tgt_type = target.entity_type
+
+        # Check out_edges for source to find common relation types to target's type
+        if source.id in self.out_edges:
+            for rel_type, indices in self.out_edges[source.id].items():
+                for idx in indices[:5]:  # sample
+                    r = self.relations[idx]
+                    tail_entity = self.id_to_entity.get(r.tail_id)
+                    if tail_entity and tail_entity.entity_type == tgt_type:
+                        return self.relation_type_names.get(rel_type, f"relation_{rel_type}")
+
+        # Fallback: just use "similar"
+        return "similar"
+
     def _wave_query(self, seed_ids: List[int], topk: int) -> List[QueryResult]:
-        """Perform wave propagation query."""
+        """Perform wave propagation query (v0.1 fallback)."""
         activation = {eid: 1.0 for eid in seed_ids}
 
         for hop in range(2):
@@ -607,6 +962,7 @@ class RamishFile:
             avg_weight = sum(weights) / len(weights) if weights else 0
 
             hubs.append(HubInfo(
+                entity_id=eid,
                 name=entity.name,
                 entity_type=entity.entity_type,
                 degree=degree_counts[eid],
@@ -628,27 +984,40 @@ class RamishFile:
                 break
         return result
 
-    def get_relations(self, entity_name: str) -> List[Any]:
-        """Get all relations for an entity."""
-        entity_id = self.name_to_id.get(entity_name.lower())
-        if entity_id is None:
-            return []
+    def get_relations(self, entity_name: str, entity_id: Optional[int] = None) -> List[Any]:
+        """Get all relations for an entity.
 
+        If entity_id is provided, uses it directly (disambiguation).
+        Otherwise resolves by name — if ambiguous, returns relations for ALL
+        matching entities with source_entity_id set on each result.
+        """
         @dataclass
         class RelInfo:
             relation: str
             target: str
             truth_weight: float
+            source_entity_id: Optional[int] = None
 
+        if entity_id is not None:
+            resolve_ids = [entity_id]
+        else:
+            resolve_ids, _ = self.resolve_name(entity_name)
+
+        if not resolve_ids:
+            return []
+
+        tag_source = len(resolve_ids) > 1
         results = []
-        if entity_id in self.neighbors:
-            for neighbor_id, rel_type, weight in self.neighbors[entity_id]:
-                neighbor = self.id_to_entity.get(neighbor_id)
-                rel_name = self.relation_type_names.get(rel_type, f"relation_{rel_type}")
-                results.append(RelInfo(
-                    relation=rel_name,
-                    target=neighbor.name if neighbor else f"entity_{neighbor_id}",
-                    truth_weight=weight
-                ))
+        for eid in resolve_ids:
+            if eid in self.neighbors:
+                for neighbor_id, rel_type, weight in self.neighbors[eid]:
+                    neighbor = self.id_to_entity.get(neighbor_id)
+                    rel_name = self.relation_type_names.get(rel_type, f"relation_{rel_type}")
+                    results.append(RelInfo(
+                        relation=rel_name,
+                        target=neighbor.name if neighbor else f"entity_{neighbor_id}",
+                        truth_weight=weight,
+                        source_entity_id=eid if tag_source else None
+                    ))
 
         return sorted(results, key=lambda r: -r.truth_weight)
