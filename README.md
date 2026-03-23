@@ -82,6 +82,20 @@ Generate `.ramish` files at [ramish.io](https://ramish.io).
 
 ## Changelog
 
+### v0.2.1 (2026-03-23)
+
+**Geometric mode** — New `RamishFile.load_geometric()` classmethod loads files via memory-mapping with zero RAM overhead. Entities are read for display names; relations, embeddings, and weights are mmap'd. All public methods (`query`, `validate_claim`, `get_relations`, `get_top_hubs`, `audit`, `get_stats`, `narrow`, `autocomplete`) transparently select the right code path based on load mode.
+
+**RNIX name resolution** — Binary search name lookup via RNIX trailer (written at assembly time). Exact resolve in ~3 µs, prefix search for free. Used in both geometric and standard load modes when trailer is detected.
+
+**Bidirectional binary search** — Sorted relations enable O(log n) edge lookups. Forward search uses head_id sort order; reverse search uses TSIX trailer (pre-computed tail_id argsort). Falls back to computed argsort for files under 50M relations, or outgoing-only for larger files without TSIX.
+
+**TSIX trailer** — New trailer section storing pre-computed tail sort index. Assembler writes it once; reader mmap's it for zero-RAM reverse lookups at any scale. Format: `TSIX` magic + relation_count(u64) + dtype_code(u8) + pad(3B) + index data (u32 or u64 per relation).
+
+**Sampled audit** — `audit()` in geometric mode uses sampled mmap analysis for orphan detection, weight distribution, and degree imbalance instead of loading all relations into RAM.
+
+**Test suite** — 126 tests (40 new geometric mode tests covering RNIX, TSIX, binary search, query engine, validate_claim, get_relations, stats, audit, top_hubs, narrow, context manager). Zero regressions on existing 86 tests.
+
 ### v0.2.0 (2026-03-23)
 
 **Geometric query engine** — `query()` now uses hybrid lexical-seed → geometric retrieval → graph rerank, replacing the v0.1 wave-propagation path. Geometry provides recall, graph edges provide precision. Results without graph support are marked with `~similar`.

@@ -15,6 +15,7 @@ v0.2 changes:
 import struct
 import json
 import re
+import mmap
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple, Union
@@ -26,6 +27,8 @@ from .quate import hamilton_product_np, quaternion_conjugate_np
 
 
 MAGIC = b'RAMISH'
+RNIX_MAGIC = b'RNIX'
+TSIX_MAGIC = b'TSIX'  # Tail Sort IndeX — pre-computed argsort on tail_id
 VERSION = 1
 
 # Quantization type codes stored in header flags field
@@ -112,10 +115,85 @@ def get_verdict(weight: float, num_paths: int) -> str:
         return "LOW CONFIDENCE - limited verification"
 
 
+# Relation section record layout (10 bytes): head_id(u32) + rel_type(u16) + tail_id(u32)
+RELATION_DTYPE = np.dtype([('head_id', '<u4'), ('rel_type', '<u2'), ('tail_id', '<u4')])
+RNIX_HEADER_SIZE = 16
+RNIX_ENTRY_SIZE = 16  # u64 + u16 + i32 + u2
+
+
+class _RNIXReader:
+    """Read-only mmap-backed RNIX name index. Zero RAM for lookups."""
+
+    def __init__(self, mm: mmap.mmap, offset: int):
+        """Initialize from an existing mmap at a given byte offset."""
+        self._mm = mm
+        self._base = offset
+
+        assert mm[offset:offset + 4] == RNIX_MAGIC, f"Bad RNIX magic at offset {offset}"
+        self.entry_count = struct.unpack_from('<I', mm, offset + 4)[0]
+        self._names_blob_size = struct.unpack_from('<Q', mm, offset + 8)[0]
+        self._names_start = offset + RNIX_HEADER_SIZE
+        self._table_start = self._names_start + self._names_blob_size
+
+    def _get_name(self, idx: int) -> bytes:
+        pos = self._table_start + idx * RNIX_ENTRY_SIZE
+        off = struct.unpack_from('<Q', self._mm, pos)[0]
+        nlen = struct.unpack_from('<H', self._mm, pos + 8)[0]
+        start = self._names_start + off
+        return self._mm[start:start + nlen]
+
+    def _get_entry(self, idx: int) -> Tuple[bytes, int, int]:
+        pos = self._table_start + idx * RNIX_ENTRY_SIZE
+        off, nlen, eid, etype = struct.unpack_from('<QHiH', self._mm, pos)
+        start = self._names_start + off
+        name = self._mm[start:start + nlen]
+        return name, eid, etype
+
+    def search(self, query: str, max_results: int = 20) -> List[Tuple[int, int, str, str]]:
+        """Binary search for exact and prefix matches.
+
+        Returns list of (entity_id, type_id, name, match_type)
+        where match_type is 'exact' or 'prefix'.
+        """
+        q = query.lower().encode('utf-8')
+        lo, hi = 0, self.entry_count
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._get_name(mid) < q:
+                lo = mid + 1
+            else:
+                hi = mid
+
+        results = []
+        i = lo
+        while i < self.entry_count and len(results) < max_results:
+            name, eid, etype = self._get_entry(i)
+            if name == q:
+                results.append((eid, etype, name.decode('utf-8'), 'exact'))
+            elif name.startswith(q):
+                results.append((eid, etype, name.decode('utf-8'), 'prefix'))
+            else:
+                break
+            i += 1
+        return results
+
+    def resolve_ids(self, query: str) -> List[int]:
+        """Resolve a name to entity IDs (exact matches only)."""
+        results = self.search(query)
+        return [eid for eid, _, _, mtype in results if mtype == 'exact']
+
+
 class RamishFile:
     """Handler for .ramish file format (read-only)."""
 
-    def __init__(self):
+    def __init__(self, path: Optional[str] = None):
+        """Initialize a RamishFile, optionally loading from a .ramish file.
+
+        Usage:
+            rf = RamishFile("data.ramish")       # load on construction
+            rf = RamishFile.load("data.ramish")   # classmethod (equivalent)
+            rf = RamishFile()                      # empty instance (advanced use)
+        """
         self.entities: List[Any] = []
         self.relations: List[Any] = []
         self.relation_types: Dict[str, int] = {}
@@ -150,6 +228,25 @@ class RamishFile:
         # v0.2 Step 5: Frozen key cache
         self._frozen_keys: Dict[int, np.ndarray] = {}
         self._frozen_key_stability: Dict[int, float] = {}
+
+        # Progressive Name Index (PNI) — optional, for scale-ready name resolution
+        self._pni = None
+
+        # Geometric mode — mmap-backed, zero-RAM for large files
+        self._geometric_mode: bool = False
+        self._rnix: Optional[_RNIXReader] = None
+        self._mmap_file = None
+        self._mmap_obj: Optional[mmap.mmap] = None
+        self._relations_mmap: Optional[np.ndarray] = None
+        self._weights_mmap: Optional[np.ndarray] = None
+        self._relation_section_offset: int = 0
+        self._embedding_section_offset: int = 0
+        self._weight_section_offset: int = 0
+        self._relations_sorted: bool = False
+        self._tail_sort_idx: Optional[np.ndarray] = None
+
+        if path is not None:
+            self._load_from_path(path)
 
     # ── Step 2: Canonical quaternion layout helper ─────────────────
 
@@ -226,69 +323,242 @@ class RamishFile:
 
     @classmethod
     def load(cls, path: str) -> 'RamishFile':
-        """Load from .ramish file.
+        """Load from .ramish file (full mode — all data in RAM).
 
-        Handles both legacy (fp32) and quantized (fp16/int8) formats.
-        Embeddings are always dequantized to fp32 on load so all
-        downstream code works without modification.
+        Shorthand for ``RamishFile(path)``.  Both patterns work::
+
+            rf = RamishFile.load("data.ramish")   # classmethod
+            rf = RamishFile("data.ramish")         # constructor
         """
+        return cls(path)
+
+    @classmethod
+    def load_geometric(cls, path: str) -> 'RamishFile':
+        """Load in geometric mode — mmap-backed for large files.
+
+        Entities are read into memory for display names.
+        Embeddings, relations, and weights are memory-mapped (zero RAM).
+        Name resolution uses RNIX binary search instead of dicts.
+        Relation lookups use binary search on sorted relation section.
+
+        Requires RNIX trailer (written by the assembler).
+        Use this when standard load() would exhaust RAM.
+
+        Usage::
+
+            rf = RamishFile.load_geometric("science_core.ramish")
+            results = rf.query("quantum computing")
+        """
+        instance = cls.__new__(cls)
+        instance.__init__()
+        instance._load_geometric_from_path(path)
+        return instance
+
+    def _load_geometric_from_path(self, path: str):
+        """Internal: load in geometric mode with mmap-backed access."""
         path = Path(path)
-        rf = cls()
-        rf._loaded_path = path
+        self._loaded_path = path
+        self._geometric_mode = True
 
         file_size = path.stat().st_size
 
         with open(path, 'rb') as f:
             header = f.read(64)
-            rf._parse_header(header)
+            self._parse_header(header)
+            self._validate_header(header, file_size)
+
+            # Read entity names (needed for display)
+            self._read_entities(f)
+
+            # Record relation section offset, SKIP reading into Python list
+            self._relation_section_offset = f.tell()
+            relation_section_bytes = self._relation_count * 10
+            f.seek(relation_section_bytes, 1)
+
+            # Record embedding section offset, SKIP reading into numpy
+            self._embedding_section_offset = f.tell()
+            if self._entity_count > 0 and self._embedding_dim > 0:
+                total_components = self._entity_count * self._embedding_dim * 4
+                quant_code = self._quant_code
+                bytes_per = {QUANT_FP16: 2, QUANT_INT8: 1}.get(quant_code, 4)
+                f.seek(total_components * bytes_per, 1)
+                self._quantize_dtype = QUANT_DTYPE_MAP.get(quant_code, "fp32")
+
+            # Record weight section offset, skip
+            self._weight_section_offset = f.tell()
+            f.seek(self._relation_count * 4, 1)
+
+            # Read metadata
+            meta_len = struct.unpack('<I', f.read(4))[0]
+            meta_bytes = f.read(meta_len)
+            self._parse_metadata(json.loads(meta_bytes.decode('utf-8')))
+
+            # RNIX trailer required
+            self._rnix_offset = f.tell()
+            trailer_magic = f.read(4)
+            if trailer_magic != RNIX_MAGIC:
+                raise ValueError(
+                    "Geometric mode requires RNIX trailer. "
+                    "Use RamishFile.load() for files without RNIX."
+                )
+
+            # Compute end of RNIX section to check for TSIX
+            rnix_entry_count = struct.unpack_from('<I', f.read(4), 0)[0]
+            rnix_names_blob_size = struct.unpack_from('<Q', f.read(8), 0)[0]
+            rnix_total = (RNIX_HEADER_SIZE +
+                          rnix_names_blob_size +
+                          rnix_entry_count * RNIX_ENTRY_SIZE)
+            self._tsix_offset = None
+            tsix_check_pos = self._rnix_offset + rnix_total
+            f.seek(tsix_check_pos)
+            tsix_magic = f.read(4)
+            if tsix_magic == TSIX_MAGIC:
+                self._tsix_offset = tsix_check_pos
+
+        # mmap the entire file
+        self._mmap_file = open(path, 'rb')
+        self._mmap_obj = mmap.mmap(
+            self._mmap_file.fileno(), 0, access=mmap.ACCESS_READ
+        )
+
+        # RNIX for name resolution
+        self._rnix = _RNIXReader(self._mmap_obj, self._rnix_offset)
+
+        # mmap relations as structured numpy array
+        self._relations_mmap = np.memmap(
+            path, dtype=RELATION_DTYPE, mode='r',
+            offset=self._relation_section_offset,
+            shape=(self._relation_count,)
+        )
+        # Check if sorted by head_id
+        if self._relation_count > 1:
+            sample = min(1000, self._relation_count)
+            heads = self._relations_mmap['head_id'][:sample]
+            self._relations_sorted = bool(np.all(heads[:-1] <= heads[1:]))
+
+        # Tail sort index for bidirectional lookups
+        # Priority 1: TSIX section (pre-computed at assembly time, mmap'd — zero RAM)
+        # Priority 2: Compute on load for small files (< 50M relations)
+        # Priority 3: None — incoming lookups degrade gracefully (outgoing only)
+        self._tail_sort_idx = None
+        if self._tsix_offset is not None and self._relations_sorted:
+            # TSIX format: magic(4B) + relation_count(u64, 8B) + dtype_code(u8) + pad(3B) = 16B header
+            # Then: relation_count × sizeof(dtype) indices
+            tsix_header_size = 16
+            tsix_dtype_code = self._mmap_obj[self._tsix_offset + 12]
+            tsix_dtype = np.uint64 if tsix_dtype_code == 1 else np.uint32
+            self._tail_sort_idx = np.memmap(
+                path, dtype=tsix_dtype, mode='r',
+                offset=self._tsix_offset + tsix_header_size,
+                shape=(self._relation_count,)
+            )
+        elif self._relations_sorted and self._relation_count <= 50_000_000:
+            # Small file fallback: compute on load (~400 MB for 50M rels)
+            tails = self._relations_mmap['tail_id']
+            self._tail_sort_idx = np.argsort(tails).astype(np.int64)
+
+        # mmap embeddings (keep raw dtype — dequantize on access for queries)
+        if self._entity_count > 0 and self._embedding_dim > 0:
+            embed_dtype_map = {QUANT_FP16: np.float16, QUANT_INT8: np.int8}
+            embed_dtype = embed_dtype_map.get(self._quant_code, np.float32)
+            self.embeddings = np.memmap(
+                path, dtype=embed_dtype, mode='r',
+                offset=self._embedding_section_offset,
+                shape=(self._entity_count, self._embedding_dim * 4)
+            )
+            # Norms for cosine similarity (reads through mmap, stores only 1D array)
+            emb_f32 = self.embeddings.astype(np.float32) if embed_dtype != np.float32 else self.embeddings
+            self._embedding_norms = np.linalg.norm(emb_f32, axis=1)
+
+        # mmap trust weights
+        if self._relation_count > 0:
+            self._weights_mmap = np.memmap(
+                path, dtype=np.float32, mode='r',
+                offset=self._weight_section_offset,
+                shape=(self._relation_count,)
+            )
+
+        # Minimal indexes (entities only — no relation dicts)
+        self._build_indexes_geometric()
+
+    def _load_from_path(self, path: str):
+        """Internal: populate this instance from a .ramish file.
+
+        Handles both legacy (fp32) and quantized (fp16/int8) formats.
+        Embeddings are always dequantized to fp32 on load so all
+        downstream code works without modification.
+        Detects RNIX trailer for name resolution acceleration.
+        """
+        path = Path(path)
+        self._loaded_path = path
+
+        file_size = path.stat().st_size
+
+        with open(path, 'rb') as f:
+            header = f.read(64)
+            self._parse_header(header)
 
             # v0.2 Step 7: Validate header before allocating
-            rf._validate_header(header, file_size)
+            self._validate_header(header, file_size)
 
-            rf._read_entities(f)
-            rf._read_relations(f)
+            self._read_entities(f)
 
-            if rf._entity_count > 0 and rf._embedding_dim > 0:
-                total_components = rf._entity_count * rf._embedding_dim * 4
-                quant_code = rf._quant_code
+            self._relation_section_offset = f.tell()
+            self._read_relations(f)
+
+            self._embedding_section_offset = f.tell()
+
+            if self._entity_count > 0 and self._embedding_dim > 0:
+                total_components = self._entity_count * self._embedding_dim * 4
+                quant_code = self._quant_code
 
                 if quant_code == QUANT_FP16:
                     embed_bytes = f.read(total_components * 2)
                     raw = np.frombuffer(embed_bytes, dtype=np.float16).reshape(
-                        rf._entity_count, rf._embedding_dim * 4
+                        self._entity_count, self._embedding_dim * 4
                     )
-                    rf.embeddings = EmbeddingQuantizer.dequantize({
+                    self.embeddings = EmbeddingQuantizer.dequantize({
                         "embeddings": raw, "dtype": "fp16"
                     })
-                    rf._quantize_dtype = "fp16"
+                    self._quantize_dtype = "fp16"
                 elif quant_code == QUANT_INT8:
                     embed_bytes = f.read(total_components)
                     raw = np.frombuffer(embed_bytes, dtype=np.int8).reshape(
-                        rf._entity_count, rf._embedding_dim * 4
+                        self._entity_count, self._embedding_dim * 4
                     )
-                    rf.embeddings = EmbeddingQuantizer.dequantize({
-                        "embeddings": raw, "dtype": "int8", "scale": rf._int8_scale
+                    self.embeddings = EmbeddingQuantizer.dequantize({
+                        "embeddings": raw, "dtype": "int8", "scale": self._int8_scale
                     })
-                    rf._quantize_dtype = "int8"
+                    self._quantize_dtype = "int8"
                 else:
                     embed_bytes = f.read(total_components * 4)
-                    rf.embeddings = np.frombuffer(embed_bytes, dtype=np.float32).reshape(
-                        rf._entity_count, rf._embedding_dim * 4
+                    self.embeddings = np.frombuffer(embed_bytes, dtype=np.float32).reshape(
+                        self._entity_count, self._embedding_dim * 4
                     ).copy()
-                    rf._quantize_dtype = "fp32"
+                    self._quantize_dtype = "fp32"
 
-            if rf._relation_count > 0:
-                weight_size = rf._relation_count * 4
+            self._weight_section_offset = f.tell()
+
+            if self._relation_count > 0:
+                weight_size = self._relation_count * 4
                 weight_bytes = f.read(weight_size)
-                rf.truth_weights = np.frombuffer(weight_bytes, dtype=np.float32).copy()
+                self.truth_weights = np.frombuffer(weight_bytes, dtype=np.float32).copy()
 
             meta_len = struct.unpack('<I', f.read(4))[0]
             meta_bytes = f.read(meta_len)
-            rf._parse_metadata(json.loads(meta_bytes.decode('utf-8')))
+            self._parse_metadata(json.loads(meta_bytes.decode('utf-8')))
 
-        rf._build_indexes()
+            # Detect RNIX trailer
+            self._rnix_offset = f.tell()
+            remaining = f.read(4)
+            if remaining == RNIX_MAGIC:
+                self._mmap_file = open(path, 'rb')
+                self._mmap_obj = mmap.mmap(
+                    self._mmap_file.fileno(), 0, access=mmap.ACCESS_READ
+                )
+                self._rnix = _RNIXReader(self._mmap_obj, self._rnix_offset)
 
-        return rf
+        self._build_indexes()
 
     def save(self, path: Path, quantize: str = "fp32"):
         """Save to .ramish file (supports requantize command)."""
@@ -550,6 +820,182 @@ class RamishFile:
         self._weight_threshold = float(np.percentile(self.truth_weights, 75))
         self._weight_threshold = max(self._weight_threshold, 0.1)
 
+    def _build_indexes_geometric(self):
+        """Build minimal indexes for geometric mode — entities only, no relation dicts."""
+        self.name_to_id = {}
+        self.name_to_ids = {}
+        self.id_to_entity = {}
+        for e in self.entities:
+            key = e.name.lower()
+            self.name_to_id[key] = e.id
+            if key not in self.name_to_ids:
+                self.name_to_ids[key] = []
+            self.name_to_ids[key].append(e.id)
+            self.id_to_entity[e.id] = e
+
+        # Adaptive threshold from mmap'd weights
+        if self._weights_mmap is not None and len(self._weights_mmap) > 0:
+            # Sample for threshold (don't load all 2B weights into RAM)
+            sample_size = min(100_000, len(self._weights_mmap))
+            sample_idx = np.linspace(0, len(self._weights_mmap) - 1,
+                                     sample_size, dtype=int)
+            sample = self._weights_mmap[sample_idx]
+            self._avg_weight = float(np.mean(sample))
+            self._weight_threshold = float(np.percentile(sample, 75))
+            self._weight_threshold = max(self._weight_threshold, 0.1)
+        else:
+            self._avg_weight = 0.5
+            self._weight_threshold = 0.5
+
+    def _binary_search_outgoing(self, head_id: int) -> List[Tuple[int, int, float]]:
+        """Find outgoing relations (entity is head) via binary search.
+
+        Returns list of (tail_id, rel_type, weight).
+        Only works when relations are sorted by head_id.
+        """
+        if self._relations_mmap is None or not self._relations_sorted:
+            return []
+
+        heads = self._relations_mmap['head_id']
+        left = int(np.searchsorted(heads, head_id, side='left'))
+        right = int(np.searchsorted(heads, head_id, side='right'))
+
+        results = []
+        for i in range(left, right):
+            rec = self._relations_mmap[i]
+            tail_id = int(rec['tail_id'])
+            rel_type = int(rec['rel_type'])
+            weight = float(self._weights_mmap[i]) if self._weights_mmap is not None else 0.5
+            results.append((tail_id, rel_type, weight))
+        return results
+
+    def _binary_search_incoming(self, tail_id: int) -> List[Tuple[int, int, float]]:
+        """Find incoming relations (entity is tail) via sorted tail index.
+
+        Returns list of (head_id, rel_type, weight) — note: returns
+        the OTHER entity (head_id) as the neighbor, matching the
+        convention in self.neighbors.
+        """
+        if (self._relations_mmap is None or self._tail_sort_idx is None):
+            return []
+
+        # _tail_sort_idx maps sorted position → original index
+        # The tail_id column reordered by _tail_sort_idx is sorted
+        tails_sorted = self._relations_mmap['tail_id'][self._tail_sort_idx]
+        left = int(np.searchsorted(tails_sorted, tail_id, side='left'))
+        right = int(np.searchsorted(tails_sorted, tail_id, side='right'))
+
+        results = []
+        for pos in range(left, right):
+            orig_idx = int(self._tail_sort_idx[pos])
+            rec = self._relations_mmap[orig_idx]
+            head_id = int(rec['head_id'])
+            rel_type = int(rec['rel_type'])
+            weight = float(self._weights_mmap[orig_idx]) if self._weights_mmap is not None else 0.5
+            results.append((head_id, rel_type, weight))
+        return results
+
+    def _binary_search_relations(self, entity_id: int) -> List[Tuple[int, int, float]]:
+        """Find ALL relations for an entity — both directions.
+
+        Returns list of (neighbor_id, rel_type, weight), matching
+        the format of self.neighbors[entity_id] in full-load mode.
+        Merges outgoing (entity is head) + incoming (entity is tail).
+        """
+        outgoing = self._binary_search_outgoing(entity_id)
+        incoming = self._binary_search_incoming(entity_id)
+        return outgoing + incoming
+
+    def _binary_search_edge(self, head_id: int, tail_id: int,
+                            rel_type: Optional[int] = None) -> Optional[Tuple[float, int]]:
+        """Check if a specific edge exists via binary search.
+
+        Searches both directions: head→tail and tail→head.
+        Returns (weight, rel_type) if found, None otherwise.
+        """
+        if self._relations_mmap is None or not self._relations_sorted:
+            return None
+
+        # Forward: head_id as head
+        heads = self._relations_mmap['head_id']
+        left = int(np.searchsorted(heads, head_id, side='left'))
+        right = int(np.searchsorted(heads, head_id, side='right'))
+
+        for i in range(left, right):
+            rec = self._relations_mmap[i]
+            if int(rec['tail_id']) == tail_id:
+                rt = int(rec['rel_type'])
+                if rel_type is None or rt == rel_type:
+                    w = float(self._weights_mmap[i]) if self._weights_mmap is not None else 0.5
+                    return (w, rt)
+
+        # Reverse: head_id as tail (the edge was stored as tail_id→head_id)
+        left = int(np.searchsorted(heads, tail_id, side='left'))
+        right = int(np.searchsorted(heads, tail_id, side='right'))
+
+        for i in range(left, right):
+            rec = self._relations_mmap[i]
+            if int(rec['tail_id']) == head_id:
+                rt = int(rec['rel_type'])
+                if rel_type is None or rt == rel_type:
+                    w = float(self._weights_mmap[i]) if self._weights_mmap is not None else 0.5
+                    return (w, rt)
+
+        return None
+
+    @property
+    def is_geometric_mode(self) -> bool:
+        """Whether this file was loaded in geometric (mmap) mode."""
+        return self._geometric_mode
+
+    @property
+    def has_rnix(self) -> bool:
+        """Whether RNIX name index is available."""
+        return self._rnix is not None
+
+    def close(self):
+        """Release mmap resources. Call when done with geometric mode files.
+
+        On Windows, numpy memmaps hold file handles independently of
+        mmap.mmap. Explicit del + gc.collect ensures file locks release.
+        """
+        if self._mmap_obj is not None:
+            self._mmap_obj.close()
+            self._mmap_obj = None
+        if self._mmap_file is not None:
+            self._mmap_file.close()
+            self._mmap_file = None
+        self._rnix = None
+        # Explicitly delete memmap arrays — Windows holds file locks
+        # until the numpy memmap object is garbage collected
+        if self._relations_mmap is not None:
+            del self._relations_mmap
+            self._relations_mmap = None
+        if self._weights_mmap is not None:
+            del self._weights_mmap
+            self._weights_mmap = None
+        if self._tail_sort_idx is not None:
+            del self._tail_sort_idx
+            self._tail_sort_idx = None
+        # Embeddings may be memmap'd in geometric mode
+        if self._geometric_mode and self.embeddings is not None:
+            del self.embeddings
+            self.embeddings = None
+            if self._embedding_norms is not None:
+                del self._embedding_norms
+                self._embedding_norms = None
+        import gc
+        gc.collect()
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
     # ── Fix 3: Centralized name resolution ─────────────────────────
 
     def resolve_name(self, name: str) -> Tuple[List[int], bool]:
@@ -557,7 +1003,16 @@ class RamishFile:
 
         Returns (entity_ids, ambiguous) where ambiguous=True when
         multiple entities share the same name.  Empty list if no match.
+        Uses RNIX binary search when available (geometric mode or
+        standard load with RNIX trailer detected).
         """
+        # RNIX fast path — zero-RAM binary search on sorted name index
+        if self._rnix is not None:
+            ids = self._rnix.resolve_ids(name)
+            if ids:
+                return (ids, len(ids) > 1)
+            # Fall through to dict for RNIX miss (shouldn't happen, but safe)
+
         key = name.lower()
         ids = self.name_to_ids.get(key, [])
         if ids:
@@ -575,10 +1030,88 @@ class RamishFile:
         if ids:
             return (ids, ambiguous, [])
 
-        # Fuzzy: substring match against all known names
+        # Fuzzy: RNIX prefix search or dict substring match
+        if self._rnix is not None:
+            results = self._rnix.search(name, max_results=max_suggestions)
+            suggestions = [r[2] for r in results]  # (eid, etype, name, match_type)
+            return ([], False, suggestions)
+
         key = name.lower()
         suggestions = [n for n in self.name_to_ids.keys() if key in n]
         return ([], False, suggestions[:max_suggestions])
+
+    # ── Progressive Name Index (PNI) ──────────────────────────────
+
+    def load_pni(self, path: str):
+        """Load a Progressive Name Index from an external file.
+
+        Enables progressive narrowing and fast exact name resolution.
+        Used for large files where dict-based name lookup is impractical.
+        For small files, the built-in dict indexes work fine without PNI.
+        """
+        from processing.ramish.progressive_index import PNIReader
+        self._pni = PNIReader(path)
+
+    def build_pni(self):
+        """Build a PNI from current entities (in-memory, for testing).
+
+        For production, PNI is written as a trailer section during
+        .ramish assembly and loaded via load_pni() or detected on load.
+        """
+        from processing.ramish.progressive_index import PNIWriter, PNIReader
+        import tempfile
+        writer = PNIWriter()
+        for e in self.entities:
+            writer.add(e.name, e.id)
+        tmp = tempfile.NamedTemporaryFile(suffix='.pni', delete=False)
+        writer.write(tmp.name)
+        self._pni = PNIReader(tmp.name)
+
+    @property
+    def has_pni(self) -> bool:
+        """Whether a Progressive Name Index is loaded."""
+        return self._pni is not None
+
+    def narrow(self, text: str, max_results: int = 20) -> List[Tuple[int, str, str, int]]:
+        """Progressive name narrowing. Returns candidates sorted by hub weight.
+
+        Each result: (entity_id, display_name, entity_type, connection_count)
+
+        Uses RNIX if available, then PNI, falls back to dict-based prefix search.
+        """
+        if self._rnix is not None:
+            rnix_results = self._rnix.search(text, max_results=max_results * 2)
+            entity_ids = [eid for eid, _, _, _ in rnix_results]
+        elif self._pni is not None:
+            entity_ids = self._pni.narrow(text, max_results=max_results * 2)
+        else:
+            # Dict fallback: prefix match on name_to_ids
+            text_lower = text.lower().strip()
+            entity_ids = []
+            for name, ids in self.name_to_ids.items():
+                if name.startswith(text_lower):
+                    entity_ids.extend(ids)
+                if len(entity_ids) >= max_results * 2:
+                    break
+
+        # Resolve to display info + sort by hub weight
+        candidates = []
+        for eid in entity_ids:
+            entity = self.id_to_entity.get(eid)
+            if entity:
+                if self._geometric_mode and self._relations_sorted:
+                    # Binary search for connection count
+                    conn_count = len(self._binary_search_relations(eid))
+                else:
+                    conn_count = len(self.neighbors.get(eid, []))
+                candidates.append((eid, entity.name, entity.entity_type, conn_count))
+
+        candidates.sort(key=lambda x: -x[3])
+        return candidates[:max_results]
+
+    def autocomplete(self, prefix: str, max_results: int = 10) -> List[Tuple[int, str, str, int]]:
+        """Autocomplete for interactive use. Alias for narrow()."""
+        return self.narrow(prefix, max_results=max_results)
 
     # ── Step 8: Geometric query engine ────────────────────────────
 
@@ -610,10 +1143,46 @@ class RamishFile:
 
         seed_entities = []
 
-        # Tier 1: entity name ⊂ query
-        for name, ids in self.name_to_ids.items():
-            if re.search(r'\b' + re.escape(name) + r'\b', query_lower):
-                seed_entities.extend(ids)
+        # Tier 0: RNIX binary search (geometric mode or standard load with RNIX)
+        # Zero-RAM sorted name lookup — skips regex scanning entirely
+        if self._rnix is not None:
+            rnix_ids = self._rnix.resolve_ids(query_lower)
+            if rnix_ids:
+                seed_entities = rnix_ids
+            else:
+                # Try prefix match for partial query terms
+                rnix_results = self._rnix.search(query_lower, max_results=10)
+                seed_entities = [eid for eid, _, _, _ in rnix_results]
+
+        # Tier 0b: PNI resolution (if RNIX not available)
+        if not seed_entities and self._pni is not None:
+            pni_ids = self._pni.narrow(query_lower)
+            if pni_ids:
+                seed_entities = pni_ids
+
+        # In geometric mode, skip the regex tiers — name_to_ids may be
+        # populated from entity load but regex scanning 385M names is not viable.
+        # RNIX/PNI handles seed resolution; if no seeds found, return empty.
+        if self._geometric_mode and not seed_entities:
+            # Last resort: try individual query words through RNIX
+            if self._rnix is not None:
+                words = [w for w in query_lower.split() if len(w) > 3]
+                for w in words:
+                    word_ids = self._rnix.resolve_ids(w)
+                    seed_entities.extend(word_ids)
+                    if not word_ids:
+                        word_results = self._rnix.search(w, max_results=5)
+                        seed_entities.extend(eid for eid, _, _, _ in word_results)
+                    if len(seed_entities) >= 5:
+                        break
+            if not seed_entities:
+                return []
+
+        # Tier 1: entity name ⊂ query (skip if PNI already found seeds)
+        if not seed_entities:
+            for name, ids in self.name_to_ids.items():
+                if re.search(r'\b' + re.escape(name) + r'\b', query_lower):
+                    seed_entities.extend(ids)
 
         # Tier 2: query ⊂ entity name (only if tier 1 found nothing)
         if not seed_entities and len(query_lower) > 2:
@@ -653,7 +1222,11 @@ class RamishFile:
         return self._wave_query(seed_entities, topk)
 
     def _geometric_query(self, seed_ids: List[int], topk: int) -> List[QueryResult]:
-        """Hybrid geometric query: cosine retrieval + graph neighbor injection + rerank."""
+        """Hybrid geometric query: cosine retrieval + graph neighbor injection + rerank.
+
+        In geometric mode, uses binary search on mmap'd sorted relations
+        instead of the in-memory neighbors dict.
+        """
         results = []
         seen = set()
 
@@ -668,7 +1241,15 @@ class RamishFile:
                 continue
 
             # Cosine similarity to all entities
-            similarities = self.embeddings @ seed_emb / (self._embedding_norms * seed_norm + 1e-8)
+            # In geometric mode with large files, embeddings is a memmap —
+            # the OS pages in only the rows touched by the matmul.
+            emb_f32 = self.embeddings
+            if emb_f32.dtype != np.float32:
+                # Dequantize seed for dot product
+                seed_emb = seed_emb.astype(np.float32)
+                emb_f32 = self.embeddings.astype(np.float32)
+
+            similarities = emb_f32 @ seed_emb / (self._embedding_norms * float(seed_norm) + 1e-8)
             similarities[seed_id] = -1.0  # exclude self
 
             # Get top geometric candidates
@@ -678,16 +1259,24 @@ class RamishFile:
             candidate_pool = {}  # entity_id -> (score, rel_name, is_graph_edge)
 
             # Inject known graph neighbors first (★ = known edge)
-            if seed_id in self.neighbors:
-                for neighbor_id, rel_type, weight in self.neighbors[seed_id]:
-                    rel_name = self.relation_type_names.get(rel_type, f"relation_{rel_type}")
-                    # Score: use truth weight boosted by geometric similarity
-                    geo_sim = float(similarities[neighbor_id]) if neighbor_id < len(similarities) else 0.0
-                    combined_score = 0.6 * weight + 0.4 * max(0, geo_sim)
-                    key = (seed_id, rel_type, neighbor_id)
-                    if key not in seen:
-                        candidate_pool[neighbor_id] = (combined_score, rel_name, True)
-                        seen.add(key)
+            # Geometric mode: binary search on sorted mmap'd relations
+            # Full-load mode: use in-memory neighbors dict
+            if self._geometric_mode and self._relations_sorted:
+                neighbors = self._binary_search_relations(seed_id)
+            elif seed_id in self.neighbors:
+                neighbors = self.neighbors[seed_id]
+            else:
+                neighbors = []
+
+            for neighbor_id, rel_type, weight in neighbors:
+                rel_name = self.relation_type_names.get(rel_type, f"relation_{rel_type}")
+                # Score: use truth weight boosted by geometric similarity
+                geo_sim = float(similarities[neighbor_id]) if neighbor_id < len(similarities) else 0.0
+                combined_score = 0.6 * weight + 0.4 * max(0, geo_sim)
+                key = (seed_id, rel_type, neighbor_id)
+                if key not in seen:
+                    candidate_pool[neighbor_id] = (combined_score, rel_name, True)
+                    seen.add(key)
 
             # Add geometric candidates (~ = inferred by geometry)
             for idx in geo_top:
@@ -726,13 +1315,22 @@ class RamishFile:
         return results[:topk]
 
     def _infer_relation(self, source: Any, target: Any) -> str:
-        """Infer most likely relation name between two entities based on type pair."""
-        # Look up what relation types typically connect these entity types
+        """Infer most likely relation name between two entities based on type pair.
+
+        In geometric mode, samples binary search results instead of out_edges.
+        """
         src_type = source.entity_type
         tgt_type = target.entity_type
 
-        # Check out_edges for source to find common relation types to target's type
-        if source.id in self.out_edges:
+        if self._geometric_mode and self._relations_sorted:
+            # Sample source's outgoing relations to find common rel_type to target's type
+            rels = self._binary_search_outgoing(source.id)
+            for tail_id, rel_type, _ in rels[:20]:  # sample first 20
+                tail_entity = self.id_to_entity.get(tail_id)
+                if tail_entity and tail_entity.entity_type == tgt_type:
+                    return self.relation_type_names.get(rel_type, f"relation_{rel_type}")
+        elif source.id in self.out_edges:
+            # Full-load mode: use prebuilt out_edges index
             for rel_type, indices in self.out_edges[source.id].items():
                 for idx in indices[:5]:  # sample
                     r = self.relations[idx]
@@ -743,16 +1341,28 @@ class RamishFile:
         # Fallback: just use "similar"
         return "similar"
 
+    def _get_neighbors(self, entity_id: int) -> List[Tuple[int, int, float]]:
+        """Get neighbors for an entity — abstracts geometric vs full-load mode.
+
+        Returns list of (neighbor_id, rel_type, weight).
+        """
+        if self._geometric_mode and self._relations_sorted:
+            return self._binary_search_relations(entity_id)
+        return self.neighbors.get(entity_id, [])
+
     def _wave_query(self, seed_ids: List[int], topk: int) -> List[QueryResult]:
-        """Perform wave propagation query (v0.1 fallback)."""
+        """Perform wave propagation query (v0.1 fallback).
+
+        Uses _get_neighbors() which transparently handles both
+        geometric mode (binary search) and full-load mode (dict).
+        """
         activation = {eid: 1.0 for eid in seed_ids}
 
         for hop in range(2):
             new_activation = {}
             for entity_id, act in activation.items():
-                if entity_id not in self.neighbors:
-                    continue
-                for neighbor_id, rel_type, weight in self.neighbors[entity_id]:
+                neighbors = self._get_neighbors(entity_id)
+                for neighbor_id, rel_type, weight in neighbors:
                     prop = act * weight * 0.5
                     if neighbor_id in new_activation:
                         new_activation[neighbor_id] = max(new_activation[neighbor_id], prop)
@@ -767,13 +1377,15 @@ class RamishFile:
         seen = set()
 
         for seed_id in seed_ids:
-            if seed_id not in self.neighbors:
-                continue
             seed_entity = self.id_to_entity.get(seed_id)
             if not seed_entity:
                 continue
 
-            for neighbor_id, rel_type, weight in self.neighbors[seed_id]:
+            neighbors = self._get_neighbors(seed_id)
+            if not neighbors:
+                continue
+
+            for neighbor_id, rel_type, weight in neighbors:
                 key = (seed_id, rel_type, neighbor_id)
                 if key in seen:
                     continue
@@ -798,9 +1410,14 @@ class RamishFile:
         return results[:topk]
 
     def validate_claim(self, subject: str, relation: str, object: str) -> ValidationResult:
-        """Validate a specific claim."""
-        subj_ids = self.name_to_ids.get(subject.lower(), [])
-        obj_ids = self.name_to_ids.get(object.lower(), [])
+        """Validate a specific claim.
+
+        In geometric mode, uses RNIX for name resolution and binary search
+        on sorted mmap'd relations for edge lookup.
+        """
+        # Name resolution — resolve_name already uses RNIX when available
+        subj_ids, _ = self.resolve_name(subject)
+        obj_ids, _ = self.resolve_name(object)
 
         if not subj_ids or not obj_ids:
             return ValidationResult(
@@ -820,7 +1437,15 @@ class RamishFile:
 
         for subj_id in subj_ids:
             for obj_id in obj_ids:
-                if subj_id in self.neighbors:
+                if self._geometric_mode and self._relations_sorted:
+                    # Binary search on sorted mmap'd relations
+                    result = self._binary_search_edge(subj_id, obj_id, rel_type)
+                    if result is not None:
+                        w, rt = result
+                        weight = max(weight, w)
+                        found = True
+                elif subj_id in self.neighbors:
+                    # Full-load mode: scan in-memory neighbors
                     for neighbor_id, rt, w in self.neighbors[subj_id]:
                         if neighbor_id == obj_id:
                             if rel_type is None or rt == rel_type:
@@ -845,17 +1470,31 @@ class RamishFile:
     def get_stats(self) -> RamishStats:
         """Get statistics about this file."""
         n_entities = len(self.entities)
-        n_relations = len(self.relations)
+        # In geometric mode, relations aren't loaded into self.relations
+        n_relations = self._relation_count if self._geometric_mode else len(self.relations)
         dim = self.embeddings.shape[1] // 4 if self.embeddings is not None else 0
 
         file_size = 0.0
         if self._loaded_path and self._loaded_path.exists():
             file_size = self._loaded_path.stat().st_size / (1024 * 1024)
 
-        if self.truth_weights is not None and len(self.truth_weights) > 0:
-            high = 100 * (self.truth_weights > 0.7).sum() / len(self.truth_weights)
-            medium = 100 * ((self.truth_weights > 0.3) & (self.truth_weights <= 0.7)).sum() / len(self.truth_weights)
-            low = 100 * (self.truth_weights <= 0.3).sum() / len(self.truth_weights)
+        # Weight distribution — use mmap'd weights in geometric mode
+        weights = None
+        if self._geometric_mode and self._weights_mmap is not None and len(self._weights_mmap) > 0:
+            weights = self._weights_mmap
+        elif self.truth_weights is not None and len(self.truth_weights) > 0:
+            weights = self.truth_weights
+
+        if weights is not None and len(weights) > 0:
+            # For large mmap'd arrays, sample to avoid loading everything
+            if len(weights) > 1_000_000:
+                sample_idx = np.linspace(0, len(weights) - 1, 100_000, dtype=int)
+                sample = weights[sample_idx]
+            else:
+                sample = weights
+            high = 100 * float((sample > 0.7).sum()) / len(sample)
+            medium = 100 * float(((sample > 0.3) & (sample <= 0.7)).sum()) / len(sample)
+            low = 100 * float((sample <= 0.3).sum()) / len(sample)
         else:
             high = medium = low = 0.0
 
@@ -871,55 +1510,133 @@ class RamishFile:
         )
 
     def audit(self) -> AuditResult:
-        """Run a data quality audit."""
+        """Run a data quality audit.
+
+        In geometric mode, uses sampled mmap analysis instead of
+        iterating over all relations in memory.
+        """
         issues = []
         recommendations = []
 
-        connected = set()
-        for r in self.relations:
-            connected.add(r.head_id)
-            connected.add(r.tail_id)
+        if self._geometric_mode:
+            # Sampled audit for large mmap'd files
+            n_entities = len(self.entities)
+            n_relations = self._relation_count
 
-        orphans = len(self.entities) - len(connected)
-        if orphans > 0:
-            pct = 100 * orphans / max(len(self.entities), 1)
-            severity = "high" if pct > 20 else "medium" if pct > 5 else "low"
-            issues.append(AuditIssue(
-                severity=severity,
-                description=f"{orphans} entities ({pct:.1f}%) have no connections",
-                affected_count=orphans
-            ))
-            if pct > 10:
-                recommendations.append("Consider filtering orphan entities or checking data extraction")
+            # Orphan detection via sampled relations
+            if self._relations_mmap is not None and n_relations > 0:
+                sample_size = min(500_000, n_relations)
+                if sample_size < n_relations:
+                    sample_idx = np.linspace(0, n_relations - 1, sample_size, dtype=int)
+                    heads = self._relations_mmap['head_id'][sample_idx]
+                    tails = self._relations_mmap['tail_id'][sample_idx]
+                else:
+                    heads = self._relations_mmap['head_id']
+                    tails = self._relations_mmap['tail_id']
+                connected = set(int(h) for h in heads) | set(int(t) for t in tails)
+                # Estimate orphans from sample
+                coverage = len(connected) / max(n_entities, 1)
+                est_orphans = max(0, n_entities - int(coverage * n_entities))
+                if est_orphans > 0:
+                    pct = 100 * est_orphans / max(n_entities, 1)
+                    severity = "high" if pct > 20 else "medium" if pct > 5 else "low"
+                    sampled_note = " (sampled estimate)" if sample_size < n_relations else ""
+                    issues.append(AuditIssue(
+                        severity=severity,
+                        description=f"~{est_orphans} entities ({pct:.1f}%) have no connections{sampled_note}",
+                        affected_count=est_orphans
+                    ))
+                    if pct > 10:
+                        recommendations.append("Consider filtering orphan entities or checking data extraction")
 
-        if self.truth_weights is not None:
-            threshold = self._weight_threshold or 0.5
-            low_threshold = threshold * 0.3
-            low_weight = (self.truth_weights < low_threshold).sum()
-            if low_weight > 0:
-                pct = 100 * low_weight / len(self.truth_weights)
-                severity = "medium" if pct > 30 else "low"
+            # Weight analysis via sampled mmap
+            weights = self._weights_mmap
+            if weights is not None and len(weights) > 0:
+                sample_size = min(100_000, len(weights))
+                if sample_size < len(weights):
+                    sample_idx = np.linspace(0, len(weights) - 1, sample_size, dtype=int)
+                    sample = weights[sample_idx]
+                else:
+                    sample = weights
+                threshold = self._weight_threshold or 0.5
+                low_threshold = threshold * 0.3
+                low_weight_pct = 100 * float((sample < low_threshold).sum()) / len(sample)
+                if low_weight_pct > 0:
+                    est_low = int(low_weight_pct * n_relations / 100)
+                    severity = "medium" if low_weight_pct > 30 else "low"
+                    issues.append(AuditIssue(
+                        severity=severity,
+                        description=f"~{est_low} relations ({low_weight_pct:.1f}%) have very low confidence (sampled)",
+                        affected_count=est_low
+                    ))
+                    if low_weight_pct > 20:
+                        recommendations.append("Review low-confidence relations for potential data quality issues")
+
+            # Degree imbalance: sample entity degrees via binary search
+            if self._relations_sorted and self._relations_mmap is not None:
+                sample_eids = np.random.choice(n_entities, min(1000, n_entities), replace=False)
+                degrees = []
+                for eid in sample_eids:
+                    rels = self._binary_search_relations(int(eid))
+                    degrees.append(len(rels))
+                if degrees:
+                    max_deg = max(degrees)
+                    degrees_sorted = sorted(degrees)
+                    median_deg = degrees_sorted[len(degrees_sorted) // 2]
+                    if max_deg > max(1, median_deg) * 100:
+                        issues.append(AuditIssue(
+                            severity="low",
+                            description=f"Extreme hub imbalance: sampled max degree {max_deg} vs median {median_deg}",
+                            affected_count=1
+                        ))
+
+        else:
+            # Full-load mode: original audit path
+            connected = set()
+            for r in self.relations:
+                connected.add(r.head_id)
+                connected.add(r.tail_id)
+
+            orphans = len(self.entities) - len(connected)
+            if orphans > 0:
+                pct = 100 * orphans / max(len(self.entities), 1)
+                severity = "high" if pct > 20 else "medium" if pct > 5 else "low"
                 issues.append(AuditIssue(
                     severity=severity,
-                    description=f"{low_weight} relations ({pct:.1f}%) have very low confidence",
-                    affected_count=int(low_weight)
+                    description=f"{orphans} entities ({pct:.1f}%) have no connections",
+                    affected_count=orphans
                 ))
-                if pct > 20:
-                    recommendations.append("Review low-confidence relations for potential data quality issues")
+                if pct > 10:
+                    recommendations.append("Consider filtering orphan entities or checking data extraction")
 
-        degree_counts = {}
-        for eid in self.neighbors:
-            degree_counts[eid] = len(self.neighbors[eid])
+            if self.truth_weights is not None:
+                threshold = self._weight_threshold or 0.5
+                low_threshold = threshold * 0.3
+                low_weight = (self.truth_weights < low_threshold).sum()
+                if low_weight > 0:
+                    pct = 100 * low_weight / len(self.truth_weights)
+                    severity = "medium" if pct > 30 else "low"
+                    issues.append(AuditIssue(
+                        severity=severity,
+                        description=f"{low_weight} relations ({pct:.1f}%) have very low confidence",
+                        affected_count=int(low_weight)
+                    ))
+                    if pct > 20:
+                        recommendations.append("Review low-confidence relations for potential data quality issues")
 
-        if degree_counts:
-            max_degree = max(degree_counts.values())
-            median_degree = sorted(degree_counts.values())[len(degree_counts) // 2]
-            if max_degree > median_degree * 100:
-                issues.append(AuditIssue(
-                    severity="low",
-                    description=f"Extreme hub imbalance: max degree {max_degree} vs median {median_degree}",
-                    affected_count=1
-                ))
+            degree_counts = {}
+            for eid in self.neighbors:
+                degree_counts[eid] = len(self.neighbors[eid])
+
+            if degree_counts:
+                max_degree = max(degree_counts.values())
+                median_degree = sorted(degree_counts.values())[len(degree_counts) // 2]
+                if max_degree > median_degree * 100:
+                    issues.append(AuditIssue(
+                        severity="low",
+                        description=f"Extreme hub imbalance: max degree {max_degree} vs median {median_degree}",
+                        affected_count=1
+                    ))
 
         if not issues:
             overall_score = 1.0
@@ -935,13 +1652,65 @@ class RamishFile:
         )
 
     def get_top_hubs(self, n: int = 10) -> List[HubInfo]:
-        """Get the top hub entities by degree."""
+        """Get the top hub entities by degree.
+
+        In geometric mode with sorted relations, uses numpy unique counts
+        on the mmap'd head_id column for efficient degree computation.
+        """
+        threshold = self._weight_threshold or 0.5
+
+        if self._geometric_mode and self._relations_mmap is not None and self._relations_sorted:
+            # Count degree (both directions) using head_id + tail_id columns
+            heads = self._relations_mmap['head_id']
+            tails = self._relations_mmap['tail_id']
+            n_rels = len(heads)
+
+            if n_rels > 10_000_000:
+                sample_size = min(5_000_000, n_rels)
+                sample_idx = np.linspace(0, n_rels - 1, sample_size, dtype=int)
+                all_ids = np.concatenate([heads[sample_idx], tails[sample_idx]])
+            else:
+                all_ids = np.concatenate([np.array(heads), np.array(tails)])
+
+            unique_ids, counts = np.unique(all_ids, return_counts=True)
+
+            # Sort by count descending, take top n
+            top_idx = np.argsort(counts)[::-1][:n * 2]  # extra for fallback
+
+            hubs = []
+            for idx in top_idx:
+                eid = int(unique_ids[idx])
+                entity = self.id_to_entity.get(eid)
+                if not entity:
+                    continue
+
+                # Get actual relations for this hub to compute thick/loose
+                rels = self._binary_search_relations(eid)
+                degree = len(rels)
+                thick = sum(1 for _, _, w in rels if w >= threshold)
+                loose = degree - thick
+                avg_w = sum(w for _, _, w in rels) / degree if degree > 0 else 0.0
+
+                hubs.append(HubInfo(
+                    entity_id=eid,
+                    name=entity.name,
+                    entity_type=entity.entity_type,
+                    degree=degree,
+                    thick_cables=thick,
+                    loose_threads=loose,
+                    avg_weight=avg_w
+                ))
+                if len(hubs) >= n:
+                    break
+
+            return hubs
+
+        # Full-load mode: original path
         degree_counts = {}
         for eid in self.neighbors:
             degree_counts[eid] = len(self.neighbors[eid])
 
         top_ids = sorted(degree_counts.keys(), key=lambda x: -degree_counts[x])[:n]
-        threshold = self._weight_threshold or 0.5
 
         hubs = []
         for eid in top_ids:
@@ -990,6 +1759,9 @@ class RamishFile:
         If entity_id is provided, uses it directly (disambiguation).
         Otherwise resolves by name — if ambiguous, returns relations for ALL
         matching entities with source_entity_id set on each result.
+
+        In geometric mode, uses binary search on sorted mmap'd relations
+        instead of the in-memory neighbors dict.
         """
         @dataclass
         class RelInfo:
@@ -1001,6 +1773,7 @@ class RamishFile:
         if entity_id is not None:
             resolve_ids = [entity_id]
         else:
+            # resolve_name already uses RNIX when available
             resolve_ids, _ = self.resolve_name(entity_name)
 
         if not resolve_ids:
@@ -1009,7 +1782,20 @@ class RamishFile:
         tag_source = len(resolve_ids) > 1
         results = []
         for eid in resolve_ids:
-            if eid in self.neighbors:
+            if self._geometric_mode and self._relations_sorted:
+                # Binary search on sorted mmap'd relations
+                neighbors = self._binary_search_relations(eid)
+                for neighbor_id, rel_type, weight in neighbors:
+                    neighbor = self.id_to_entity.get(neighbor_id)
+                    rel_name = self.relation_type_names.get(rel_type, f"relation_{rel_type}")
+                    results.append(RelInfo(
+                        relation=rel_name,
+                        target=neighbor.name if neighbor else f"entity_{neighbor_id}",
+                        truth_weight=weight,
+                        source_entity_id=eid if tag_source else None
+                    ))
+            elif eid in self.neighbors:
+                # Full-load mode: in-memory neighbors dict
                 for neighbor_id, rel_type, weight in self.neighbors[eid]:
                     neighbor = self.id_to_entity.get(neighbor_id)
                     rel_name = self.relation_type_names.get(rel_type, f"relation_{rel_type}")
